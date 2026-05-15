@@ -75,8 +75,9 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_active_receipts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ACTIVE_RECEIPTS:
-        message = update.message or update.callback_query.message
-        await message.reply_text("Нет активных чеков. Загрузите новый!")
+        message = update.message or (update.callback_query.message if update.callback_query else None)
+        if message:
+            await message.reply_text("Нет активных чеков. Загрузите новый!")
         return SELECTING_ACTION
     
     buttons = []
@@ -85,10 +86,12 @@ async def list_active_receipts(update: Update, context: ContextTypes.DEFAULT_TYP
         buttons.append([InlineKeyboardButton(f"{r['name']} ({date_str})", callback_data=f"select_receipt_{rid}")])
     
     markup = InlineKeyboardMarkup(buttons)
-    if update.message:
-        await update.message.reply_text("Выберите чек для распределения позиций:", reply_markup=markup)
-    else:
-        await update.callback_query.message.edit_text("Выберите чек для распределения позиций:", reply_markup=markup)
+    # Команда "Список чеков" всегда отправляет новое сообщение
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Выберите чек для распределения позиций:",
+        reply_markup=markup
+    )
     return SELECTING_ACTION
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,6 +106,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "back_to_list":
+        # Возврат к списку - это "команда" на смену контекста, отправим новое сообщение
         return await list_active_receipts(update, context)
 
     if data.startswith("select_receipt_"):
@@ -110,7 +114,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in user_data: user_data[user_id] = {}
         user_data[user_id]["current_rid"] = rid
         user_data[user_id]["item_page"] = 0
-        return await show_interactive_items(update, context)
+        # Выбор чека - новое сообщение
+        return await show_interactive_items(update, context, edit=False)
 
     if data.startswith("toggle_item_"):
         parts = data.split("_")
@@ -121,13 +126,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 item["selected_by"].remove(user_id)
             else:
                 item["selected_by"].add(user_id)
-            return await show_interactive_items(update, context)
+            # Действие (клик по товару) - редактируем сообщение
+            return await show_interactive_items(update, context, edit=True)
 
     if data.startswith("page_"):
         page = int(data.split("_")[1])
         if user_id not in user_data: user_data[user_id] = {}
         user_data[user_id]["item_page"] = page
-        return await show_interactive_items(update, context)
+        # Действие (смена страницы) - редактируем сообщение
+        return await show_interactive_items(update, context, edit=True)
 
     if data == "show_my_total":
         rid = user_data[user_id].get("current_rid")
@@ -136,17 +143,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected_items = []
             for item in ACTIVE_RECEIPTS[rid]["items"]:
                 if user_id in item["selected_by"]:
-                    # Делим итоговую сумму (sum) на количество участников
                     share = item["total_sum"] / len(item["selected_by"])
                     total += share
                     qty_label = f" ({item['quantity']} шт/кг)" if item['quantity'] != 1 else ""
                     selected_items.append(f"▫️ {item['name']}{qty_label}\n   └ {share:.2f}₽ (из {item['total_sum']:.2f}₽)")
             
             summary = "\n".join(selected_items)
-            await query.message.reply_text(f"🧾 Ваш список:\n\n{summary}\n\n💰 ВАШ ИТОГО: {total:.2f}₽")
+            # Итог - это "команда", новое сообщение
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🧾 Ваш список:\n\n{summary}\n\n💰 ВАШ ИТОГО: {total:.2f}₽"
+            )
         return
 
-async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     user_id = update.effective_user.id
     query = update.callback_query
     rid = user_data[user_id].get("current_rid")
@@ -154,7 +164,7 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
     per_page = 8
 
     if not rid or rid not in ACTIVE_RECEIPTS:
-        await query.message.edit_text("Чек не найден.")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Чек не найден.")
         return
 
     items = ACTIVE_RECEIPTS[rid]["items"]
@@ -166,17 +176,12 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
         item = items[i]
         users_count = len(item["selected_by"])
         mark = "✅ " if user_id in item["selected_by"] else ""
-        
-        # Кол-во выбравших переносим налево
         count_label = f"[{users_count}] " if users_count > 0 else "[0] "
         
         qty_val = item['quantity']
-        if qty_val == 1:
-            qty_part = ""
-        elif qty_val % 1 == 0:
-            qty_part = f"({int(qty_val)}шт) "
-        else:
-            qty_part = f"({qty_val}кг) "
+        qty_part = ""
+        if qty_val != 1:
+            qty_part = f"({int(qty_val)}шт) " if qty_val % 1 == 0 else f"({qty_val}кг) "
 
         btn_text = f"{mark}{count_label}{item['total_sum']:.2f}₽ {qty_part}{item['name']}"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_item_{rid}_{i}")])
@@ -196,10 +201,17 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
     header = f"🧾 {ACTIVE_RECEIPTS[rid]['name']}\n💰 Итого по чеку: {ACTIVE_RECEIPTS[rid]['total_sum']:.2f}₽"
     text = f"{header}\n\nСтр. {page+1} из {(len(items)-1)//per_page + 1}"
     
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    except BadRequest:
-        pass
+    if edit and query:
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        except BadRequest:
+            pass
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
     return
 
 @restricted
@@ -227,6 +239,7 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 items_data = []
                 total_receipt_sum = 0
+                receipt_date = ""
                 receipts = data if isinstance(data, list) else [data]
                 for r in receipts:
                     receipt_obj = r.get('ticket', {}).get('document', {}).get('receipt', {})
@@ -235,7 +248,16 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     if receipt_obj:
                         items_data.extend(receipt_obj.get('items', []))
-                        # Если в JSON есть totalSum, берем его, иначе будем суммировать товары
+                        # Извлекаем дату и время из чека
+                        dt_str = receipt_obj.get('dateTime', '')
+                        if dt_str:
+                            try:
+                                # Преобразуем из 2026-05-09T20:30:00 в более читаемый вид
+                                dt_obj = datetime.datetime.fromisoformat(dt_str.replace('Z', ''))
+                                receipt_date = dt_obj.strftime('%d.%m %H:%M')
+                            except Exception:
+                                receipt_date = dt_str
+                        
                         receipt_total = float(receipt_obj.get('totalSum', 0)) / 100.0
                         if receipt_total > 0:
                             total_receipt_sum += receipt_total
@@ -263,14 +285,13 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except (ValueError, TypeError):
                         continue
                 
-                # Если totalSum в чеке был 0, используем сумму всех позиций
                 if total_receipt_sum == 0:
                     total_receipt_sum = calculated_total
                 
                 rid = hashlib.md5(f"{datetime.datetime.now()}_{user_id}".encode()).hexdigest()[:8]
                 ACTIVE_RECEIPTS[rid] = {
                     "items": receipt_items,
-                    "name": f"Чек {datetime.datetime.now().strftime('%H:%M:%S')}",
+                    "name": f"Чек {receipt_date}" if receipt_date else f"Чек {datetime.datetime.now().strftime('%H:%M')}",
                     "created_at": datetime.datetime.now().isoformat(),
                     "total_sum": total_receipt_sum
                 }
