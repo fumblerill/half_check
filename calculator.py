@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 import csv
 import io
 import tempfile
@@ -9,7 +10,7 @@ import datetime
 from functools import wraps
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from dotenv import load_dotenv
 
 # Загрузка переменных из .env файла
@@ -21,6 +22,8 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+# httpx logs Telegram request URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Состояния диалога
 SELECTING_ACTION, ADDING_MEMBERS, ADDING_PRODUCT_NAME, PROCESSING_JSON = range(4)
@@ -29,6 +32,11 @@ SELECTING_ACTION, ADDING_MEMBERS, ADDING_PRODUCT_NAME, PROCESSING_JSON = range(4
 user_data = {}
 # Общее хранилище чеков для всех пользователей
 ACTIVE_RECEIPTS = {}
+
+# Telegram API can occasionally take longer than its default timeout to return
+# metadata or contents of an uploaded document.
+TELEGRAM_TIMEOUT = 30
+FILE_DOWNLOAD_ATTEMPTS = 3
 
 # Список разрешенных ID из .env
 ALLOWED_USERS = [int(uid.strip()) for uid in os.getenv("ALLOWED_USERS", "").split(",") if uid.strip()]
@@ -214,6 +222,36 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
         )
     return
 
+async def download_document(document, destination):
+    """Download a Telegram document, retrying temporary network failures."""
+    for attempt in range(1, FILE_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            telegram_file = await document.get_file(
+                read_timeout=TELEGRAM_TIMEOUT,
+                write_timeout=TELEGRAM_TIMEOUT,
+                connect_timeout=TELEGRAM_TIMEOUT,
+                pool_timeout=TELEGRAM_TIMEOUT,
+            )
+            await telegram_file.download_to_drive(
+                destination,
+                read_timeout=TELEGRAM_TIMEOUT,
+                write_timeout=TELEGRAM_TIMEOUT,
+                connect_timeout=TELEGRAM_TIMEOUT,
+                pool_timeout=TELEGRAM_TIMEOUT,
+            )
+            return
+        except NetworkError:
+            if attempt == FILE_DOWNLOAD_ATTEMPTS:
+                raise
+            delay = 2 ** (attempt - 1)
+            logger.warning(
+                "Telegram file download failed (attempt %s/%s); retrying in %s s",
+                attempt,
+                FILE_DOWNLOAD_ATTEMPTS,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
 @restricted
 async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -223,18 +261,18 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PROCESSING_JSON
     
     document = update.message.document
-    if not document.file_name.endswith('.json'):
+    if not document.file_name or not document.file_name.lower().endswith('.json'):
         await update.message.reply_text("Файл должен быть в формате JSON.")
         return PROCESSING_JSON
     
     await update.message.reply_text("Обрабатываю JSON...")
-    file = await document.get_file()
-    
+    tmp_file_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp_file:
             tmp_file_path = tmp_file.name
-            await file.download_to_drive(tmp_file_path)
-            with open(tmp_file_path, 'r', encoding='utf-8') as f:
+        await download_document(document, tmp_file_path)
+
+        with open(tmp_file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 
                 items_data = []
@@ -298,12 +336,19 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await update.message.reply_text(f"Чек загружен! ID: {rid}")
                 return await list_active_receipts(update, context)
-    except Exception as e:
-        logger.error(f"Error: {e}")
+    except NetworkError:
+        logger.exception("Could not download JSON file from Telegram")
+        await update.message.reply_text(
+            "Не удалось скачать файл из Telegram из-за проблем с сетью. "
+            "Попробуйте отправить JSON ещё раз."
+        )
+        return PROCESSING_JSON
+    except Exception:
+        logger.exception("Error while processing JSON file")
         await update.message.reply_text("Ошибка при обработке файла.")
         return SELECTING_ACTION
     finally:
-        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
+        if tmp_file_path and os.path.exists(tmp_file_path):
             os.unlink(tmp_file_path)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,7 +362,15 @@ def main():
         logger.error("TELEGRAM_TOKEN not found!")
         return
         
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(TELEGRAM_TIMEOUT)
+        .read_timeout(TELEGRAM_TIMEOUT)
+        .write_timeout(TELEGRAM_TIMEOUT)
+        .pool_timeout(TELEGRAM_TIMEOUT)
+        .build()
+    )
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -332,7 +385,8 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_callback, pattern="^(select_receipt_|toggle_item_|page_|show_my_total|back_to_list)"))
     
     logger.info("Bot started...")
-    application.run_polling()
+    # Keep retrying when Telegram is temporarily unreachable during startup.
+    application.run_polling(bootstrap_retries=-1)
 
 if __name__ == '__main__':
     main()
