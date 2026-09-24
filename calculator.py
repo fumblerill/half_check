@@ -1,17 +1,16 @@
 import logging
 import os
 import asyncio
-import csv
-import io
 import tempfile
 import json
-import hashlib
 import datetime
+import uuid
 from functools import wraps
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
 from telegram.error import BadRequest, NetworkError
 from dotenv import load_dotenv
+import database
 
 # Загрузка переменных из .env файла
 load_dotenv()
@@ -28,10 +27,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # Состояния диалога
 SELECTING_ACTION, ADDING_MEMBERS, ADDING_PRODUCT_NAME, PROCESSING_JSON = range(4)
 
-# Глобальное хранилище данных пользователей
+# Per-user navigation state only lives in Telegram's current process. Receipts,
+# items, and selections are persisted in MySQL.
 user_data = {}
-# Общее хранилище чеков для всех пользователей
-ACTIVE_RECEIPTS = {}
 
 # Telegram API can occasionally take longer than its default timeout to return
 # metadata or contents of an uploaded document.
@@ -56,8 +54,7 @@ def restricted(func):
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in user_data:
-        user_data[user_id] = {}
+    user_data.setdefault(user_id, {})
     
     keyboard = [["Загрузить JSON", "Список чеков"]]
     await update.message.reply_text(
@@ -82,15 +79,16 @@ async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SELECTING_ACTION
 
 async def list_active_receipts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ACTIVE_RECEIPTS:
+    receipts = await database.list_receipts()
+    if not receipts:
         message = update.message or (update.callback_query.message if update.callback_query else None)
         if message:
             await message.reply_text("Нет активных чеков. Загрузите новый!")
         return SELECTING_ACTION
     
     buttons = []
-    for rid, r in ACTIVE_RECEIPTS.items():
-        date_str = r['created_at'].split('T')[0]
+    for rid, r in receipts.items():
+        date_str = r['created_at'].strftime('%Y-%m-%d')
         buttons.append([InlineKeyboardButton(f"{r['name']} ({date_str})", callback_data=f"select_receipt_{rid}")])
     
     markup = InlineKeyboardMarkup(buttons)
@@ -119,7 +117,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("select_receipt_"):
         rid = data.replace("select_receipt_", "")
-        if user_id not in user_data: user_data[user_id] = {}
+        user_data.setdefault(user_id, {})
         user_data[user_id]["current_rid"] = rid
         user_data[user_id]["item_page"] = 0
         # Выбор чека - новое сообщение
@@ -128,28 +126,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("toggle_item_"):
         parts = data.split("_")
         rid, idx = parts[2], int(parts[3])
-        if rid in ACTIVE_RECEIPTS:
-            item = ACTIVE_RECEIPTS[rid]["items"][idx]
-            if user_id in item["selected_by"]:
-                item["selected_by"].remove(user_id)
-            else:
-                item["selected_by"].add(user_id)
+        user_data.setdefault(user_id, {})["current_rid"] = rid
+        receipt = await database.get_receipt(rid)
+        if receipt and 0 <= idx < len(receipt["items"]):
+            await database.toggle_selection(rid, idx, user_id)
             # Действие (клик по товару) - редактируем сообщение
             return await show_interactive_items(update, context, edit=True)
 
     if data.startswith("page_"):
-        page = int(data.split("_")[1])
-        if user_id not in user_data: user_data[user_id] = {}
+        parts = data.split("_")
+        page = int(parts[1])
+        user_data.setdefault(user_id, {})
+        if len(parts) > 2:
+            user_data[user_id]["current_rid"] = parts[2]
         user_data[user_id]["item_page"] = page
         # Действие (смена страницы) - редактируем сообщение
         return await show_interactive_items(update, context, edit=True)
 
     if data == "show_my_total":
-        rid = user_data[user_id].get("current_rid")
-        if rid and rid in ACTIVE_RECEIPTS:
+        rid = user_data.setdefault(user_id, {}).get("current_rid")
+        receipt = await database.get_receipt(rid) if rid else None
+        if receipt:
             total = 0
             selected_items = []
-            for item in ACTIVE_RECEIPTS[rid]["items"]:
+            for item in receipt["items"]:
                 if user_id in item["selected_by"]:
                     share = item["total_sum"] / len(item["selected_by"])
                     total += share
@@ -167,15 +167,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     user_id = update.effective_user.id
     query = update.callback_query
-    rid = user_data[user_id].get("current_rid")
-    page = user_data[user_id].get("item_page", 0)
+    state = user_data.setdefault(user_id, {})
+    rid = state.get("current_rid")
+    page = state.get("item_page", 0)
     per_page = 8
 
-    if not rid or rid not in ACTIVE_RECEIPTS:
+    receipt = await database.get_receipt(rid) if rid else None
+    if not receipt:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="Чек не найден.")
         return
 
-    items = ACTIVE_RECEIPTS[rid]["items"]
+    items = receipt["items"]
     start_idx = page * per_page
     end_idx = start_idx + per_page
     
@@ -196,9 +198,9 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{page-1}_{rid}"))
     if end_idx < len(items):
-        nav.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"page_{page+1}"))
+        nav.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"page_{page+1}_{rid}"))
     
     if nav:
         buttons.append(nav)
@@ -206,7 +208,7 @@ async def show_interactive_items(update: Update, context: ContextTypes.DEFAULT_T
     buttons.append([InlineKeyboardButton("💰 Мой итог", callback_data="show_my_total")])
     buttons.append([InlineKeyboardButton("🏠 К списку чеков", callback_data="back_to_list")])
 
-    header = f"🧾 {ACTIVE_RECEIPTS[rid]['name']}\n💰 Итого по чеку: {ACTIVE_RECEIPTS[rid]['total_sum']:.2f}₽"
+    header = f"🧾 {receipt['name']}\n💰 Итого по чеку: {receipt['total_sum']:.2f}₽"
     text = f"{header}\n\nСтр. {page+1} из {(len(items)-1)//per_page + 1}"
     
     if edit and query:
@@ -326,13 +328,10 @@ async def process_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if total_receipt_sum == 0:
                     total_receipt_sum = calculated_total
                 
-                rid = hashlib.md5(f"{datetime.datetime.now()}_{user_id}".encode()).hexdigest()[:8]
-                ACTIVE_RECEIPTS[rid] = {
-                    "items": receipt_items,
-                    "name": f"Чек {receipt_date}" if receipt_date else f"Чек {datetime.datetime.now().strftime('%H:%M')}",
-                    "created_at": datetime.datetime.now().isoformat(),
-                    "total_sum": total_receipt_sum
-                }
+                rid = uuid.uuid4().hex
+                created_at = datetime.datetime.now()
+                name = f"Чек {receipt_date}" if receipt_date else f"Чек {created_at.strftime('%H:%M')}"
+                await database.create_receipt(rid, name, created_at, total_receipt_sum, receipt_items)
                 
                 await update.message.reply_text(f"Чек загружен! ID: {rid}")
                 return await list_active_receipts(update, context)
@@ -362,6 +361,12 @@ def main():
         logger.error("TELEGRAM_TOKEN not found!")
         return
         
+    async def post_init(app):
+        await database.initialize()
+
+    async def post_shutdown(app):
+        await database.close()
+
     application = (
         Application.builder()
         .token(token)
@@ -369,6 +374,8 @@ def main():
         .read_timeout(TELEGRAM_TIMEOUT)
         .write_timeout(TELEGRAM_TIMEOUT)
         .pool_timeout(TELEGRAM_TIMEOUT)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
     

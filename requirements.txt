@@ -1,3 +1,5 @@
 python-telegram-bot>=20.0
 matplotlib
 python-dotenv
+aiomysql>=0.2.0
+cryptography>=42.0.0

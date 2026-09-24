@@ -70,3 +70,18 @@
 ## Лицензия
 
 © 2026 HalfCheck. Распространяется под лицензией MIT.
+
+## Хранение данных в MySQL
+
+Чеки, позиции и отметки участников хранятся в MySQL и переживают перезапуск бота. При запуске бот автоматически создаёт необходимые таблицы.
+
+Для Docker Compose задайте в `.env` отдельные пароли базы данных:
+
+```env
+MYSQL_DATABASE=halfcheck
+MYSQL_USER=halfcheck
+MYSQL_PASSWORD=надёжный_пароль
+MYSQL_ROOT_PASSWORD=другой_надёжный_пароль
+```
+
+Затем выполните `docker compose up -d --build`. Данные MySQL сохраняются в Docker volume `mysql_data`. Для локального запуска без Compose укажите `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER` и `MYSQL_PASSWORD` для уже запущенного сервера MySQL.

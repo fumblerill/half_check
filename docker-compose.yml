@@ -1,9 +1,38 @@
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: halfcheck_mysql
+    restart: always
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-halfcheck}
+      MYSQL_USER: ${MYSQL_USER:-halfcheck}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-halfcheck}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-halfcheck}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=root --password=\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   bot:
     build: .
     container_name: calculator_bot
     restart: always
     env_file:
       - .env
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-halfcheck}
+      MYSQL_USER: ${MYSQL_USER:-halfcheck}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-halfcheck}
+    depends_on:
+      mysql:
+        condition: service_healthy
     volumes:
       - .:/app:Z
+
+volumes:
+  mysql_data:
